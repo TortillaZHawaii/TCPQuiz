@@ -18,10 +18,17 @@
 
 #define BACKLOG 3
 volatile sig_atomic_t do_work = 1;
+volatile sig_atomic_t accept_users = 1;
+
 void sigint_handler(int sig)
 {
     do_work = 0;
 }
+void sigusr1_handler(int sig)
+{
+    accept_users = 0;
+}
+
 int sethandler(void (*f)(int), int sigNo)
 {
     struct sigaction act;
@@ -120,8 +127,8 @@ void usage(char *name)
     exit(EXIT_FAILURE);
 }
 
-int proccess_request(int cfd) {
-    if (bulk_write(cfd, (char*)"x", sizeof(char[2])) < 0)
+int writeMessageTo(int cfd, char* message, size_t message_size) {
+    if (bulk_write(cfd, message, message_size) < 0)
     {
         if(errno == EPIPE) // klient sie odlaczyl
             return -1;
@@ -144,11 +151,11 @@ int findFreeIndex(int* connections, int max_users) {
     return -1;
 }
 
-void writeToAll(int* connections, int max_users) {
+void writeToAll(int* connections, int max_users, char* message, size_t message_size) {
     for (int i = 0; i < max_users; ++i)
     {
         if(connections[i] > 0) {
-            if(proccess_request(connections[i]) < 0) // try to write x
+            if(writeMessageTo(connections[i], message, message_size) < 0) // try to write x
             {
                 connections[i] = 0; // zwalnianie miejsca
             }
@@ -162,6 +169,22 @@ void debug_print_tab(int* tab, int tab_size){
     printf("\n");
 }
 
+void checkNewClient(int fd, int* cons, int max_users) {
+    int cfd;
+    if ((cfd = add_new_client(fd)) >= 0)
+    {
+        int index = findFreeIndex(cons, max_users);
+        
+        if(index >= 0) // zapisujemy do tabeli cons
+            cons[index] = cfd;
+        else { // brak miejsca
+            write_no(cfd);
+            if(TEMP_FAILURE_RETRY(close(cfd)) < 0)
+                ERR("close");
+        }
+    }
+}
+
 void doServer(int fd, int max_users) 
 {
     int* cons = (int*)malloc(sizeof(int) * max_users); 
@@ -173,7 +196,6 @@ void doServer(int fd, int max_users)
         cons[i] = 0;
     }
 
-    int cfd;
     fd_set base_rfds, rfds;
     sigset_t mask, oldmask;
     FD_ZERO(&base_rfds);
@@ -181,37 +203,34 @@ void doServer(int fd, int max_users)
     int fdmax = fd;
     sigemptyset(&mask);
     sigaddset(&mask, SIGINT);
+    sigaddset(&mask, SIGUSR1);
     sigprocmask(SIG_BLOCK, &mask, &oldmask);
     
     while (do_work)
     {
+        if(accept_users == 0) {
+            fdmax = -1;
+            if(fd && TEMP_FAILURE_RETRY(close(fd)) < 0) // zamykanie
+                ERR("close");
+            accept_users = 1; // don't repeat this if
+        }
+        
         rfds = base_rfds;
         struct timespec t330s; // 330 ms
         t330s.tv_nsec = 330000000l; 
         t330s.tv_sec = 0;
 
-        debug_print_tab(cons, max_users);
+        //debug_print_tab(cons, max_users);
 
         int pselect_status = pselect(fdmax + 1, &rfds, NULL, NULL, &t330s, &oldmask);
 
         if (pselect_status > 0) // selected
         {
-            if ((cfd = add_new_client(fd)) >= 0)
-            {
-                int index = findFreeIndex(cons, max_users);
-                
-                if(index >= 0) // zapisujemy do tabeli cons
-                    cons[index] = cfd;
-                else { // brak miejsca
-                    write_no(cfd);
-                    if(TEMP_FAILURE_RETRY(close(cfd)) < 0)
-                        ERR("close");
-                }
-            }
+            checkNewClient(fd, cons, max_users);
         }
         else if (pselect_status == 0) // timeout
         {
-            writeToAll(cons, max_users);
+            writeToAll(cons, max_users, "x", sizeof("x"));
         }
         else // blad
         {
@@ -250,7 +269,7 @@ int main(int argc, char** argv)
         ERR("Seting SIGPIPE:");
     if (sethandler(sigint_handler, SIGINT))
         ERR("Seting SIGINT:");
-    if(sethandler(SIG_IGN, SIGUSR1))
+    if(sethandler(sigusr1_handler, SIGUSR1))
         ERR("Setting SIGUSR1");
     
     fd = bind_tcp_socket(argv[1], argv[2]);
@@ -260,7 +279,7 @@ int main(int argc, char** argv)
 
     doServer(fd, atoi(argv[3]));
 
-    if(TEMP_FAILURE_RETRY(close(fd)) < 0)
+    if(fd && TEMP_FAILURE_RETRY(close(fd)) < 0)
         ERR("close");
 
     printf("server closed");
